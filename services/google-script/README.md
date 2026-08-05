@@ -61,6 +61,24 @@
      };
      ```
 
+   - **Discord notifications (optional):** Set `DISCORD_WEBHOOK` to your webhook URL to get a Discord message for every check-in.
+
+     ```javascript
+     const DISCORD_WEBHOOK = "https://discord.com/api/webhooks/...";
+     ```
+
+   - **Automatic code redemption (optional):** Set `enableCodeRedemption` to `true` to redeem new codes after checking in. Not supported for Honkai Impact 3rd.
+
+     ```javascript
+     const config = {
+       enableCodeRedemption: true,  // redeem new codes automatically
+       notifyOnRedeemFailure: false, // also report codes that failed to redeem
+       // ...
+     };
+     ```
+
+     When `DISCORD_WEBHOOK` is set, one summary message is sent per account listing the codes that were redeemed and the rewards they granted. Nothing is sent when there are no new codes. Turn on `notifyOnRedeemFailure` if you also want to hear about codes that failed - this includes a link to redeem them manually. Codes that fail for a temporary reason (expired cookie, redemption cooldown, network errors) are retried on the next run; expired, invalid, and already-used codes are not.
+
    - **Save the Project:** Click on the floppy disk icon to save your project.
 
      ![image](https://github.com/torikushiii/hoyolab-auto/assets/21153445/7c7b36cf-937a-4003-b86e-9f5f74365a68)
