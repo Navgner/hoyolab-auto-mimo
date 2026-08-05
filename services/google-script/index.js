@@ -1,5 +1,6 @@
 const config = {
 	enableCodeRedemption: false, // Set to true to enable automatic code redemption
+	notifyOnRedeemFailure: false, // Set to true to also report codes that failed to redeem
 	genshin: {
 		data: [
 			// "account_cookie_1",
@@ -124,6 +125,28 @@ const DEFAULT_CONSTANTS = {
 		}
 	}
 };
+
+// Web redemption pages, used to offer a manual fallback when redemption fails
+const REDEMPTION_LINKS = {
+	genshin: "https://genshin.hoyoverse.com/en/gift",
+	starrail: "https://hsr.hoyoverse.com/gift",
+	zenless: "https://zenless.hoyoverse.com/redemption"
+};
+
+const REDEEM_ERROR_MESSAGES = {
+	"-1071": "The provided cookie is either invalid or expired.",
+	"-2001": "The code has expired",
+	"-2003": "The code is invalid",
+	"-2016": "Redemption is in cooldown",
+	"-2017": "The code has been used"
+};
+
+// Failures worth attempting again on the next run. Anything not listed here is
+// treated as final so we stop hammering the API with a code that will never work.
+const RETRYABLE_REDEEM_RETCODES = [
+	-1071, // cookie invalid or expired
+	-2016 // redemption cooldown
+];
 
 class Game {
 	/**
@@ -404,6 +427,7 @@ class Game {
 	async redeemCodes (account) {
 		const codes = await this.fetchCodes();
 		const redeemedCodes = this.getRedeemedCodes();
+		const results = [];
 
 		for (const code of codes) {
 			if (redeemedCodes.includes(code.code)) {
@@ -411,24 +435,35 @@ class Game {
 				continue;
 			}
 
-			await this.redeemCode(account, code.code);
+			const result = await this.redeemCode(account, code);
 			Utilities.sleep(6000);
 
-			this.saveRedeemedCode(code.code);
+			results.push(result);
+
+			// Only stop retrying a code once we know the outcome is final. Transient
+			// failures (bad cookie, cooldown, network errors) are left unsaved so the
+			// next run picks them up again.
+			if (!result.retryable) {
+				this.saveRedeemedCode(code.code);
+			}
 		}
+
+		return results;
 	}
 
 	// Force redemption of all codes regardless of previous redemption status
 	async forceRedeemCodes (account) {
 		const codes = await this.fetchCodes();
+		const results = [];
 
 		for (const code of codes) {
 			console.log(`Attempting to redeem code ${code.code} for ${this.fullName}`);
-			await this.redeemCode(account, code.code);
+			results.push(await this.redeemCode(account, code));
 			Utilities.sleep(6000);
 		}
 
 		console.log(`Completed forced code redemption for ${this.fullName}`);
+		return results;
 	}
 
 	async fetchCodes () {
@@ -448,10 +483,16 @@ class Game {
 		}
 	}
 
-	async redeemCode (account, code) {
+	async redeemCode (account, codeEntry) {
+		const code = typeof codeEntry === "string" ? codeEntry : codeEntry.code;
+		const rewards = (typeof codeEntry === "object" && Array.isArray(codeEntry.rewards))
+			? codeEntry.rewards
+			: [];
+
 		const url = this.getRedemptionUrl(account, code);
 		const options = {
 			method: this.name === "starrail" ? "POST" : "GET",
+			muteHttpExceptions: true,
 			headers: {
 				"User-Agent": this.userAgent,
 				Cookie: account.cookie
@@ -460,6 +501,19 @@ class Game {
 
 		try {
 			const response = await UrlFetchApp.fetch(url, options);
+			const statusCode = response.getResponseCode();
+
+			if (statusCode !== 200) {
+				console.error(`Code ${code} redemption for ${this.fullName} returned status ${statusCode}`);
+				return {
+					code,
+					rewards,
+					success: false,
+					retryable: true,
+					message: `Request failed with status ${statusCode}`
+				};
+			}
+
 			const data = JSON.parse(response.getContentText());
 
 			// Check for authentication errors and other failures
@@ -470,13 +524,34 @@ class Game {
 				else {
 					console.error(`Code ${code} redemption failed for ${this.fullName}:`, data);
 				}
+
+				return {
+					code,
+					rewards,
+					success: false,
+					retryable: RETRYABLE_REDEEM_RETCODES.includes(data.retcode),
+					message: REDEEM_ERROR_MESSAGES[data.retcode] || data.message || `Unknown error (retcode ${data.retcode})`
+				};
 			}
-			else {
-				console.log(`Code ${code} successfully redeemed for ${this.fullName}:`, data);
-			}
+
+			console.log(`Code ${code} successfully redeemed for ${this.fullName}:`, data);
+			return {
+				code,
+				rewards,
+				success: true,
+				retryable: false,
+				message: "Code redeemed successfully!"
+			};
 		}
 		catch (e) {
 			console.error(`Error redeeming code ${code} for ${this.fullName}:`, e);
+			return {
+				code,
+				rewards,
+				success: false,
+				retryable: true,
+				message: e.message
+			};
 		}
 	}
 
@@ -550,6 +625,10 @@ class Game {
 		}
 	}
 
+	getRedemptionLink () {
+		return REDEMPTION_LINKS[this.name] || null;
+	}
+
 	getRedeemedCodes () {
 		const redeemedCodes = PropertiesService.getScriptProperties().getProperty(`${this.name}_redeemed_codes`);
 		return redeemedCodes ? JSON.parse(redeemedCodes) : [];
@@ -580,6 +659,8 @@ function checkInGame (gameName) {
 		.then(async (successes) => {
 			console.log(`Successful check-ins for ${gameName}:`, successes);
 
+			const redeemReports = [];
+
 			// Only attempt code redemption if enabled in config
 			if (config.enableCodeRedemption) {
 				for (const success of successes) {
@@ -587,7 +668,12 @@ function checkInGame (gameName) {
 						continue;
 					}
 
-					await game.redeemCodes(success.account);
+					const results = await game.redeemCodes(success.account);
+					redeemReports.push({
+						account: success.account,
+						assets: success.assets,
+						results
+					});
 				}
 			}
 			else {
@@ -595,7 +681,13 @@ function checkInGame (gameName) {
 			}
 
 			if (DISCORD_WEBHOOK) {
-				return Promise.all(successes.filter(Boolean).map(sendDiscordNotification));
+				const notified = await Promise.all(successes.filter(Boolean).map(sendDiscordNotification));
+
+				for (const report of redeemReports) {
+					sendCodeRedeemNotification(game, report.account, report.assets, report.results);
+				}
+
+				return notified;
 			}
 			return successes;
 		})
@@ -663,16 +755,112 @@ function sendDiscordNotification (success) {
 		}
 	};
 
+	postDiscordEmbed(embed, success.assets);
+}
+
+// Shared webhook sender. The sleep keeps consecutive calls from tripping
+// Discord's rate limit when several games/accounts report in the same run.
+function postDiscordEmbed (embed, assets) {
+	if (!DISCORD_WEBHOOK) {
+		return;
+	}
+
 	Utilities.sleep(5000);
 	UrlFetchApp.fetch(DISCORD_WEBHOOK, {
 		method: "POST",
 		contentType: "application/json",
 		payload: JSON.stringify({
 			embeds: [embed],
-			username: success.assets.author,
-			avatar_url: success.assets.icon
+			username: assets.author,
+			avatar_url: assets.icon
 		})
 	});
+}
+
+// Joins one line per code, staying inside Discord's 1024 character field limit.
+function formatCodeLines (entries, formatter) {
+	const FIELD_LIMIT = 1024;
+	const lines = [];
+	let used = 0;
+
+	for (const entry of entries) {
+		const line = formatter(entry);
+		const suffix = `\n…and ${entries.length - lines.length} more`;
+
+		if (used + line.length + 1 > FIELD_LIMIT - suffix.length) {
+			lines.push(suffix.trim());
+			break;
+		}
+
+		lines.push(line);
+		used += line.length + 1;
+	}
+
+	return lines.join("\n");
+}
+
+function truncate (text, limit) {
+	return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function sendCodeRedeemNotification (game, account, assets, results) {
+	if (!DISCORD_WEBHOOK || !Array.isArray(results) || results.length === 0) {
+		return;
+	}
+
+	const redeemed = results.filter(result => result.success);
+	const failed = config.notifyOnRedeemFailure ? results.filter(result => !result.success) : [];
+
+	// Nothing new happened for this account - stay quiet rather than sending an empty report.
+	if (redeemed.length === 0 && failed.length === 0) {
+		return;
+	}
+
+	const fields = [];
+
+	if (redeemed.length > 0) {
+		fields.push({
+			name: `Redeemed (${redeemed.length})`,
+			value: formatCodeLines(redeemed, (result) => (result.rewards.length > 0
+				? `\`${result.code}\` — ${truncate(result.rewards.join(", "), 200)}`
+				: `\`${result.code}\``)),
+			inline: false
+		});
+	}
+
+	if (failed.length > 0) {
+		const redeemLink = game.getRedemptionLink();
+
+		fields.push({
+			name: `Failed (${failed.length})`,
+			value: formatCodeLines(failed, result => `\`${result.code}\` — ${truncate(result.message, 150)}`),
+			inline: false
+		});
+
+		if (redeemLink) {
+			fields.push({
+				name: "Manually Redeem Here",
+				value: redeemLink,
+				inline: false
+			});
+		}
+	}
+
+	const embed = {
+		color: 5793266,
+		title: `${assets.game} Code Redemption`,
+		author: {
+			name: `${account.uid} - ${account.nickname}`,
+			icon_url: assets.icon
+		},
+		fields,
+		timestamp: new Date(),
+		footer: {
+			text: `${assets.game} Code Redemption`
+		}
+	};
+
+	postDiscordEmbed(embed, assets);
 }
 
 function checkInAllGames () {
@@ -734,14 +922,17 @@ function manuallyRedeemCodes (gameName, forceRedeem = false) {
 
 			console.log(`Redeeming codes for ${gameName} account: ${account.nickname} (${account.uid})`);
 
-			if (forceRedeem) {
-				await game.forceRedeemCodes(account);
-				return { success: true, account, message: `Force redeemed all codes for ${account.nickname} (${account.uid})` };
-			}
-			else {
-				await game.redeemCodes(account);
-				return { success: true, account, message: `Redeemed new codes for ${account.nickname} (${account.uid})` };
-			}
+			const results = forceRedeem
+				? await game.forceRedeemCodes(account)
+				: await game.redeemCodes(account);
+
+			sendCodeRedeemNotification(game, account, game.config.assets, results);
+
+			const message = forceRedeem
+				? `Force redeemed all codes for ${account.nickname} (${account.uid})`
+				: `Redeemed new codes for ${account.nickname} (${account.uid})`;
+
+			return { success: true, account, results, message };
 		}
 		catch (e) {
 			console.error(`Error redeeming codes for ${gameName}:`, e);
