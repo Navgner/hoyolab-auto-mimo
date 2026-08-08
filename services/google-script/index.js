@@ -55,6 +55,10 @@ function viewAllRedeemedCodes () {
 }
 
 const DISCORD_WEBHOOK = null; // Replace with your Discord webhook URL (optional)
+const DISCORD_EMBEDS_PER_MESSAGE = 10; // Discord's hard limit per webhook message
+const DISCORD_MAX_MESSAGE_CHARS = 6000; // combined embed text allowed in one message
+const DISCORD_MAX_RETRIES = 5;
+const DISCORD_MAX_BACKOFF_MS = 60000;
 const DEFAULT_CONSTANTS = {
 	genshin: {
 		ACT_ID: "e202102251931481",
@@ -681,13 +685,13 @@ function checkInGame (gameName) {
 			}
 
 			if (DISCORD_WEBHOOK) {
-				const notified = await Promise.all(successes.filter(Boolean).map(sendDiscordNotification));
+				const embeds = successes.filter(Boolean).map(buildCheckInEmbed);
 
 				for (const report of redeemReports) {
-					sendCodeRedeemNotification(game, report.account, report.assets, report.results);
+					embeds.push(buildCodeRedeemEmbed(game, report.account, report.assets, report.results));
 				}
 
-				return notified;
+				postDiscordEmbeds(embeds.filter(Boolean), game.config.assets);
 			}
 			return successes;
 		})
@@ -697,12 +701,12 @@ function checkInGame (gameName) {
 		});
 }
 
-function sendDiscordNotification (success) {
+function buildCheckInEmbed (success) {
 	if (!success) {
-		return;
+		return null;
 	}
 
-	const embed = {
+	return {
 		color: 16748258,
 		title: `${success.assets.game} Daily Check-In`,
 		author: {
@@ -754,27 +758,125 @@ function sendDiscordNotification (success) {
 			text: `${success.assets.game} Daily Check-In`
 		}
 	};
-
-	postDiscordEmbed(embed, success.assets);
 }
 
-// Shared webhook sender. The sleep keeps consecutive calls from tripping
-// Discord's rate limit when several games/accounts report in the same run.
-function postDiscordEmbed (embed, assets) {
-	if (!DISCORD_WEBHOOK) {
+function embedLength (embed) {
+	let length = (embed.title || "").length + (embed.footer?.text || "").length + (embed.author?.name || "").length;
+
+	for (const field of embed.fields || []) {
+		length += field.name.length + String(field.value).length;
+	}
+
+	return length;
+}
+
+function chunkEmbeds (embeds) {
+	const chunks = [];
+	let current = [];
+	let used = 0;
+
+	for (const embed of embeds) {
+		const length = embedLength(embed);
+
+		if (current.length > 0 && (current.length >= DISCORD_EMBEDS_PER_MESSAGE || used + length > DISCORD_MAX_MESSAGE_CHARS)) {
+			chunks.push(current);
+			current = [];
+			used = 0;
+		}
+
+		current.push(embed);
+		used += length;
+	}
+
+	if (current.length > 0) {
+		chunks.push(current);
+	}
+
+	return chunks;
+}
+
+function postDiscordEmbeds (embeds, assets) {
+	if (!DISCORD_WEBHOOK || !Array.isArray(embeds) || embeds.length === 0) {
 		return;
 	}
 
-	Utilities.sleep(5000);
-	UrlFetchApp.fetch(DISCORD_WEBHOOK, {
-		method: "POST",
-		contentType: "application/json",
-		payload: JSON.stringify({
-			embeds: [embed],
+	for (const chunk of chunkEmbeds(embeds)) {
+		postDiscordPayload({
+			embeds: chunk,
 			username: assets.author,
 			avatar_url: assets.icon
-		})
-	});
+		});
+	}
+}
+
+function postDiscordPayload (payload) {
+	const options = {
+		method: "POST",
+		contentType: "application/json",
+		muteHttpExceptions: true,
+		payload: JSON.stringify(payload)
+	};
+
+	const url = `${DISCORD_WEBHOOK}?wait=true`;
+	for (let attempt = 0; attempt <= DISCORD_MAX_RETRIES; attempt++) {
+		const response = UrlFetchApp.fetch(url, options);
+		const statusCode = response.getResponseCode();
+
+		if (statusCode < 300) {
+			throttleFromHeaders(response);
+			return true;
+		}
+
+		if (statusCode !== 429) {
+			console.error("Discord webhook failed", statusCode, response.getContentText());
+			return false;
+		}
+
+		const wait = getRetryAfterMs(response, attempt);
+		console.warn(`Discord rate limited (attempt ${attempt + 1}/${DISCORD_MAX_RETRIES}), waiting ${wait}ms`);
+		Utilities.sleep(wait);
+	}
+
+	console.error("Discord webhook gave up after repeated 429 responses.");
+	return false;
+}
+
+function getDiscordHeader (response, name) {
+	const headers = response.getAllHeaders();
+	const key = Object.keys(headers).find(header => header.toLowerCase() === name.toLowerCase());
+	if (!key) {
+		return null;
+	}
+
+	const value = headers[key];
+	return Array.isArray(value) ? value[0] : value;
+}
+
+function getRetryAfterMs (response, attempt) {
+	let seconds = Number.parseFloat(getDiscordHeader(response, "Retry-After"));
+
+	if (!Number.isFinite(seconds)) {
+		try {
+			seconds = Number.parseFloat(JSON.parse(response.getContentText()).retry_after);
+		}
+		catch (e) {
+			seconds = Number.NaN;
+		}
+	}
+
+	const backoff = Number.isFinite(seconds) ? seconds * 1000 : 2 ** attempt * 1000;
+	return Math.min(backoff + Math.random() * 500, DISCORD_MAX_BACKOFF_MS);
+}
+
+function throttleFromHeaders (response) {
+	if (getDiscordHeader(response, "X-RateLimit-Remaining") !== "0") {
+		return;
+	}
+
+	const resetAfter = Number.parseFloat(getDiscordHeader(response, "X-RateLimit-Reset-After"));
+	if (Number.isFinite(resetAfter) && resetAfter > 0) {
+		Utilities.sleep(Math.min(resetAfter * 1000 + 250, DISCORD_MAX_BACKOFF_MS));
+	}
 }
 
 // Joins one line per code, staying inside Discord's 1024 character field limit.
@@ -803,9 +905,9 @@ function truncate (text, limit) {
 	return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
-function sendCodeRedeemNotification (game, account, assets, results) {
+function buildCodeRedeemEmbed (game, account, assets, results) {
 	if (!DISCORD_WEBHOOK || !Array.isArray(results) || results.length === 0) {
-		return;
+		return null;
 	}
 
 	const redeemed = results.filter(result => result.success);
@@ -813,7 +915,7 @@ function sendCodeRedeemNotification (game, account, assets, results) {
 
 	// Nothing new happened for this account - stay quiet rather than sending an empty report.
 	if (redeemed.length === 0 && failed.length === 0) {
-		return;
+		return null;
 	}
 
 	const fields = [];
@@ -846,7 +948,7 @@ function sendCodeRedeemNotification (game, account, assets, results) {
 		}
 	}
 
-	const embed = {
+	return {
 		color: 5793266,
 		title: `${assets.game} Code Redemption`,
 		author: {
@@ -859,8 +961,6 @@ function sendCodeRedeemNotification (game, account, assets, results) {
 			text: `${assets.game} Code Redemption`
 		}
 	};
-
-	postDiscordEmbed(embed, assets);
 }
 
 function checkInAllGames () {
@@ -903,6 +1003,7 @@ function manuallyRedeemCodes (gameName, forceRedeem = false) {
 		return Promise.resolve({ success: false, message: `No ${gameName} accounts provided` });
 	}
 
+	const embeds = [];
 	return Promise.all(accounts.map(async (cookieData) => {
 		try {
 			const ltuid = cookieData.match(/ltuid(?:|_v2)=([^;]+)/)[1];
@@ -926,7 +1027,10 @@ function manuallyRedeemCodes (gameName, forceRedeem = false) {
 				? await game.forceRedeemCodes(account)
 				: await game.redeemCodes(account);
 
-			sendCodeRedeemNotification(game, account, game.config.assets, results);
+			const embed = buildCodeRedeemEmbed(game, account, game.config.assets, results);
+			if (embed) {
+				embeds.push(embed);
+			}
 
 			const message = forceRedeem
 				? `Force redeemed all codes for ${account.nickname} (${account.uid})`
@@ -938,7 +1042,10 @@ function manuallyRedeemCodes (gameName, forceRedeem = false) {
 			console.error(`Error redeeming codes for ${gameName}:`, e);
 			return { success: false, message: e.message };
 		}
-	}));
+	})).then((results) => {
+		postDiscordEmbeds(embeds, game.config.assets);
+		return results;
+	});
 }
 
 function redeemGenshinCodes () {
